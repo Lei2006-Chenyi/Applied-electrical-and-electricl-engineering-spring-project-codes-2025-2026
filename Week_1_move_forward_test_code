@@ -1,0 +1,65 @@
+import RPi.GPIO as GPIO
+import time
+# --- 1. 设置引脚模式 ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# 引脚定义 (确保杜邦线确实插在这些编号上)
+ENA, ENB = 12, 13
+IN1, IN2 = 17, 18  # 左轮
+IN3, IN4 = 27, 22  # 右轮
+
+pins = [ENA, ENB, IN1, IN2, IN3, IN4]
+for pin in pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+# 设置 PWM 频率
+pwm_a = GPIO.PWM(ENA, 100) 
+pwm_b = GPIO.PWM(ENB, 100)
+pwm_a.start(0)
+pwm_b.start(0)  # 补全右轮PWM初始化
+
+def forward(speed=100):
+    # 限制占空比在0-100之间，避免报错
+    speed = max(0, min(100, speed))
+    print(f"正在尝试双轮直行，占空比: {speed}%")
+    
+    # 左轮前进
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.HIGH)
+    
+    # 右轮前进
+    GPIO.output(IN3, GPIO.HIGH) 
+    GPIO.output(IN4, GPIO.LOW)
+    
+    # 打印引脚状态，方便调试电平逻辑
+    print(f"左轮引脚状态 -> IN1:{GPIO.input(IN1)}, IN2:{GPIO.input(IN2)}")
+    print(f"右轮引脚状态 -> IN3:{GPIO.input(IN3)}, IN4:{GPIO.input(IN4)}")
+    
+    pwm_a.ChangeDutyCycle(speed)
+    pwm_b.ChangeDutyCycle(speed)
+
+def stop():
+    print("停止")
+    pwm_a.ChangeDutyCycle(0)
+    pwm_b.ChangeDutyCycle(0)
+    for pin in [IN1, IN2, IN3, IN4]:
+        GPIO.output(pin, GPIO.LOW)
+
+# --- 3. 运行测试 ---
+try:
+    print("程序启动，5秒后开始...")
+    time.sleep(5)
+    
+    forward(100) # 先用满速测试硬件是否全通
+    time.sleep(5)
+    
+    stop()
+    print("测试完成")
+
+finally:
+    pwm_a.stop()
+    pwm_b.stop()
+    GPIO.cleanup()
+    print("GPIO已清理")
+
