@@ -1,0 +1,211 @@
+mport RPi.GPIO as GPIO
+import time
+import cv2
+import numpy as np
+import threading
+from picamera2 import Picamera2
+from ultralytics import YOLO
+
+# ==========================================
+# 1. 硬件配置
+# ==========================================
+ENA, ENB = 12, 13
+IN1, IN2 = 17, 18  
+IN3, IN4 = 27, 22  
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+for pin in [ENA, ENB, IN1, IN2, IN3, IN4]: GPIO.setup(pin, GPIO.OUT)
+pwm_a = GPIO.PWM(ENA, 100); pwm_b = GPIO.PWM(ENB, 100)
+pwm_a.start(0); pwm_b.start(0)
+
+def drive_motors(l_speed, r_speed):
+    l_speed = max(-100, min(100, l_speed))
+    r_speed = max(-100, min(100, r_speed))
+    if l_speed > 5: GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
+    elif l_speed < -5: GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.HIGH)
+    else: GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.LOW)
+    if r_speed > 5: GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.HIGH)
+    elif r_speed < -5: GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
+    else: GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.LOW)
+    pwm_a.ChangeDutyCycle(abs(l_speed))
+    pwm_b.ChangeDutyCycle(abs(r_speed))
+
+# ==========================================
+# 2. 颜色参数 (红蓝翻转视图)
+# ==========================================
+# 黑线：不受通道翻转影响
+lower_black = np.array([0, 0, 0])
+upper_black = np.array([180, 255, 60])
+
+# 现实【红线】 -> 镜头里【深蓝色】(极致放宽亮度与饱和度)
+lower_red_blueview = np.array([90, 40, 20])  
+upper_red_blueview = np.array([140, 255, 255])
+
+# 现实【黄线】 -> 镜头里【浅蓝色/青色】
+lower_yellow_cyanview = np.array([85, 40, 80])  
+upper_yellow_cyanview = np.array([105, 255, 255])
+
+# ==========================================
+# 3. 全局变量 (通信与状态)
+# ==========================================
+shared_frame = None       
+stop_command = False       
+cycle_command = False      
+system_running = True     
+cooldown_until = 0        
+display_label = ""
+label_expiry = 0
+shield_until = 0  # 1.5秒无敌护盾计时器
+
+# ==========================================
+# 4. AI 大脑线程 (自带防闪烁无敌护盾)
+# ==========================================
+def yolo_thread_task():
+    global shared_frame, stop_command, cycle_command, system_running
+    global display_label, label_expiry, cooldown_until, shield_until
+    
+    print("🧠 [大脑] 正在加载 YOLO 模型...")
+    model = YOLO('/home/liuqishuo778/Desktop/best_new.pt') 
+    print("🧠 [大脑] 视觉系统与【1.5秒无敌护盾】就绪！")
+    
+    while system_running:
+        if shared_frame is not None:
+            # 拷贝当前帧，防止画面撕裂闪退
+            frame_eval = shared_frame.copy()
+            results = model(frame_eval, imgsz=128, conf=0.10, verbose=False)
+            
+            names_in_frame = []
+            stop_conf, anya_conf, cycle_conf = 0, 0, 0
+            
+            for r in results:
+                for box in r.boxes:
+                    name = model.names[int(box.cls)].lower()
+                    conf = float(box.conf)
+                    names_in_frame.append(name)
+                    
+                    display_label = f"{name.upper()} ({round(conf,2)})"
+                    label_expiry = time.time() + 1.2
+                    
+                    if name == 'stop' and conf > stop_conf: stop_conf = conf
+                    if name == 'anya' and conf > anya_conf: anya_conf = conf
+                    if name == 'cycle' and conf > cycle_conf: cycle_conf = conf
+            
+            # 【核心护盾机制】检测到干扰物，立刻激活护盾，持续 1.5 秒
+            distraction_list = ['qr', 'flnger', 'finger', 'forward', 'retreat']
+            if any(n in distraction_list for n in names_in_frame):
+                shield_until = time.time() + 1.5
+            
+            if time.time() > cooldown_until:
+                # 【防闪烁锁】检查小车现在是否戴着“护盾”
+                if time.time() < shield_until:
+                    pass # 护盾激活中，静默一切动作指令，强行防闪烁
+                else:
+                    # 护盾失效时，才允许正常触发动作
+                    if cycle_conf >= 0.10:
+                        cycle_command = True
+                    elif stop_conf >= 0.55 or anya_conf >= 0.20:
+                        stop_command = True
+                        
+        time.sleep(0.005)
+
+yolo_worker = threading.Thread(target=yolo_thread_task, daemon=True)
+yolo_worker.start()
+
+# ==========================================
+# 5. 主循环：动作执行与严格优先级巡线
+# ==========================================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"format": 'RGB888', "size": (320, 240)}))
+picam2.start()
+
+BASE_SPEED = 25  
+Kp, Kd = 0.8, 0.5
+last_error = 0
+SPIN_SPEED = 85
+SPIN_TIME = 1.6
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        shared_frame = frame  
+        # 保持原本的蓝色视图，所见即所得
+        display_frame = frame.copy() 
+
+        # ------------------------------------------
+        # 动作执行区 (最高优先级)
+        # ------------------------------------------
+        if cycle_command:
+            drive_motors(-SPIN_SPEED, SPIN_SPEED); time.sleep(SPIN_TIME)
+            drive_motors(60, 60); time.sleep(0.1) # 自转后的前冲补丁，防止发呆
+            cycle_command = False; cooldown_until = time.time() + 5
+            last_error = 0; continue
+
+        if stop_command:
+            drive_motors(0, 0); time.sleep(2.0)
+            drive_motors(60, 60); time.sleep(0.1)
+            stop_command = False; cooldown_until = time.time() + 5
+            last_error = 0; continue
+
+        # ------------------------------------------
+        # 巡线逻辑区 (红 > 黄 > 黑)
+        # ------------------------------------------
+        roi = frame[190:240, 0:320] 
+        hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+        
+        # 降噪内核
+        kernel = np.ones((5,5), np.uint8)
+
+        # 提取颜色掩码并过滤噪点
+        m_red = cv2.morphologyEx(cv2.inRange(hsv, lower_red_blueview, upper_red_blueview), cv2.MORPH_OPEN, kernel)
+        m_yellow = cv2.morphologyEx(cv2.inRange(hsv, lower_yellow_cyanview, upper_yellow_cyanview), cv2.MORPH_OPEN, kernel)
+        m_black = cv2.inRange(hsv, lower_black, upper_black)
+
+        # 保留红线调试窗口，确保你能看到暗光下的红线状态
+        cv2.imshow("Red_Logic_XRay", m_red)
+
+        cx = None
+        
+        # 【最高优先级】：现实中的红线 (深蓝视图，面积门槛 200)
+        if cv2.moments(m_red)['m00'] > 200:
+            cx = int(cv2.moments(m_red)['m10'] / cv2.moments(m_red)['m00'])
+            cv2.putText(display_frame, "MODE: RED (PRIORITY)", (10, 200), 0, 0.6, (255, 0, 0), 2)
+            
+        # 【第二优先级】：现实中的黄线 (浅蓝视图，门槛 200)
+        elif cv2.moments(m_yellow)['m00'] > 200:
+            cx = int(cv2.moments(m_yellow)['m10'] / cv2.moments(m_yellow)['m00'])
+            cv2.putText(display_frame, "MODE: YELLOW", (10, 200), 0, 0.6, (255, 255, 0), 2)
+            
+        # 【保底优先级】：黑线
+        elif cv2.moments(m_black)['m00'] > 800:
+            if cv2.moments(m_black)['m00'] > 1100000: cx = 160 # 防大面积黑块
+            else: cx = int(cv2.moments(m_black)['m10'] / cv2.moments(m_black)['m00'])
+            cv2.putText(display_frame, "MODE: BLACK", (10, 200), 0, 0.6, (0, 0, 0), 2)
+
+        # ------------------------------------------
+        # 转向控制执行区
+        # ------------------------------------------
+        if cx is not None:
+            error = 160 - cx
+            output = (Kp * error) + (Kd * (error - last_error))
+            drive_motors(BASE_SPEED - output, BASE_SPEED + output)
+            last_error = error
+        else:
+            # 丢线寻找逻辑：根据上一次的偏差惯性转身寻找
+            if last_error > 25: drive_motors(-50, 60)
+            elif last_error < -25: drive_motors(60, -50)
+            else: drive_motors(0, 0)
+
+        # UI 提示：动态显示当前遇到的 AI 标志和护盾状态
+        if time.time() < label_expiry:
+            distract_msg = " [SHIELD ON!]" if time.time() < shield_until else ""
+            cv2.putText(display_frame, f"AI: {display_label}{distract_msg}", (20, 50), 0, 0.7, (0, 255, 0), 2)
+
+        cv2.imshow("Driver View", display_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+except KeyboardInterrupt: pass
+finally:
+    # 安全退出：切断电机，清理引脚
+    system_running = False; drive_motors(0, 0)
+    GPIO.cleanup(); picam2.stop(); cv2.destroyAllWindows()
