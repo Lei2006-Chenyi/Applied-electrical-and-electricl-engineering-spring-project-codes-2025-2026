@@ -1,0 +1,23 @@
+rom picamera2 import Picamera2
+from ultralytics import YOLO
+import cv2
+
+model = YOLO('/home/liuqishuo778/Desktop/best_new.pt')
+
+picam2 = Picamera2()
+# 🔥 关键修复：摄像头改成 640x640 正方形！
+picam2.configure(picam2.create_preview_configuration(main={"format": 'RGB888', "size": (640, 640)}))
+picam2.start()
+
+print("检测开始，按Q退出")
+while True:
+    frame = picam2.capture_array()
+
+    # 🔥 第二个关键修复：强制保持比例
+    results = model(frame, conf=0.1, imgsz=640)
+
+    cv2.imshow("YOLO Detection", results[0].plot())
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+picam2.stop()
